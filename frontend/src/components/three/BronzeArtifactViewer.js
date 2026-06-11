@@ -1,6 +1,7 @@
 import * as THREE from 'three'
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
 import TWEEN from '@tweenjs/tween.js'
+import { InstancedParticleSystem } from './particle_system.js'
 
 export class BronzeArtifactViewer {
   constructor(container, options = {}) {
@@ -21,6 +22,7 @@ export class BronzeArtifactViewer {
     this.riskZones = []
     this.eruptionParticles = []
     this.particleSystems = []
+    this.instancedParticleSystems = []
     this.animationId = null
     this.clock = new THREE.Clock()
     this.riskMaterials = []
@@ -538,85 +540,12 @@ export class BronzeArtifactViewer {
 
     const eruptionGroup = new THREE.Group()
 
-    const particleCount = Math.floor(200 + severity * 400)
-    const positions = new Float32Array(particleCount * 3)
-    const colors = new Float32Array(particleCount * 3)
-    const velocities = []
-    const lifetimes = new Float32Array(particleCount)
-
-    const colorPalette = [
-      new THREE.Color(1.0, 0.15, 0.1),
-      new THREE.Color(1.0, 0.5, 0.1),
-      new THREE.Color(1.0, 0.85, 0.1),
-      new THREE.Color(0.8, 0.7, 0.2),
-      new THREE.Color(0.3, 0.6, 0.2)
-    ]
-
-    for (let i = 0; i < particleCount; i++) {
-      const theta = Math.random() * Math.PI * 2
-      const phi = Math.random() * Math.PI * 0.6
-      const r = radius * (0.2 + Math.random() * 0.8)
-
-      positions[i * 3] = r * Math.sin(phi) * Math.cos(theta)
-      positions[i * 3 + 1] = r * Math.cos(phi)
-      positions[i * 3 + 2] = r * Math.sin(phi) * Math.sin(theta)
-
-      const colorIdx = severity > 0.7
-        ? Math.floor(Math.random() * 3)
-        : Math.floor(Math.random() * colorPalette.length)
-      const c = colorPalette[colorIdx].clone()
-      c.offsetHSL(0, 0, (Math.random() - 0.5) * 0.2)
-      colors[i * 3] = c.r
-      colors[i * 3 + 1] = c.g
-      colors[i * 3 + 2] = c.b
-
-      velocities.push({
-        x: (Math.random() - 0.5) * 0.03,
-        y: 0.01 + Math.random() * 0.05 * severity,
-        z: (Math.random() - 0.5) * 0.03
-      })
-
-      lifetimes[i] = Math.random()
-    }
-
-    const geo = new THREE.BufferGeometry()
-    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3))
-    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3))
-    geo.setAttribute('lifetime', new THREE.BufferAttribute(lifetimes, 1))
-
-    const canvas = document.createElement('canvas')
-    canvas.width = 64
-    canvas.height = 64
-    const ctx = canvas.getContext('2d')
-    const gradient = ctx.createRadialGradient(32, 32, 0, 32, 32, 32)
-    gradient.addColorStop(0, 'rgba(255,255,255,1)')
-    gradient.addColorStop(0.2, 'rgba(255,220,150,0.9)')
-    gradient.addColorStop(0.5, 'rgba(255,120,60,0.5)')
-    gradient.addColorStop(1, 'rgba(255,50,30,0)')
-    ctx.fillStyle = gradient
-    ctx.fillRect(0, 0, 64, 64)
-    const tex = new THREE.CanvasTexture(canvas)
-
-    const mat = new THREE.PointsMaterial({
-      size: 0.018 + severity * 0.012,
-      vertexColors: true,
-      map: tex,
-      transparent: true,
-      opacity: 0.9,
-      depthWrite: false,
-      blending: THREE.AdditiveBlending,
-      sizeAttenuation: true
+    const particleSystem = new InstancedParticleSystem(this.scene, {
+      particleSize: 0.015 + severity * 0.01,
+      center,
+      severity
     })
-
-    const points = new THREE.Points(geo, mat)
-    points.userData = {
-      velocities,
-      isParticleSystem: true,
-      basePositions: positions.slice(),
-      lifetimes: geo.attributes.lifetime.array,
-      mat
-    }
-    eruptionGroup.add(points)
+    particleSystem.emit({ center, radius, severity })
 
     const coreGeo = new THREE.SphereGeometry(radius * 0.5, 24, 24)
     const coreMat = new THREE.MeshBasicMaterial({
@@ -662,12 +591,13 @@ export class BronzeArtifactViewer {
       zoneId,
       severity,
       isEruption: true,
-      basePosition: { ...center }
+      basePosition: { ...center },
+      particleSystem
     }
 
     this.artifactGroup.add(eruptionGroup)
     this.eruptionParticles.push(eruptionGroup)
-    this.particleSystems.push(points)
+    this.instancedParticleSystems.push(particleSystem)
 
     return eruptionGroup
   }
@@ -688,6 +618,8 @@ export class BronzeArtifactViewer {
   }
 
   clearParticles() {
+    this.instancedParticleSystems.forEach(ps => ps.dispose())
+    this.instancedParticleSystems = []
     this.eruptionParticles.forEach(z => {
       this.artifactGroup.remove(z)
       z.traverse(obj => {
@@ -754,24 +686,7 @@ export class BronzeArtifactViewer {
       })
     })
 
-    this.particleSystems.forEach(system => {
-      const pos = system.geometry.attributes.position.array
-      const life = system.userData.lifetimes
-      const base = system.userData.basePositions
-      const vel = system.userData.velocities
-      const cycle = (elapsed * 0.3) % 1.0
-
-      for (let i = 0; i < pos.length / 3; i++) {
-        let t = (cycle + life[i]) % 1.0
-        const ease = t * t * (3 - 2 * t)
-        pos[i * 3] = base[i * 3] + vel[i].x * ease * 300
-        pos[i * 3 + 1] = base[i * 3 + 1] + vel[i].y * ease * 200 + Math.sin(elapsed * 3 + i) * 0.005
-        pos[i * 3 + 2] = base[i * 3 + 2] + vel[i].z * ease * 300
-      }
-      system.geometry.attributes.position.needsUpdate = true
-      system.userData.mat.opacity = 0.6 + 0.3 * Math.sin(elapsed * 4)
-      system.rotation.y += delta * 0.1
-    })
+    this.instancedParticleSystems.forEach(ps => ps.update())
 
     this.eruptionParticles.forEach(group => {
       group.children.forEach(child => {
@@ -811,10 +726,14 @@ export class BronzeArtifactViewer {
   }
 
   showStats() {
+    const instancedStats = this.instancedParticleSystems.map(ps => ps.getStats())
     return {
       riskZones: this.riskZones.length,
       eruptions: this.eruptionParticles.length,
-      particles: this.particleSystems.reduce((s, p) => s + p.geometry.attributes.position.count, 0)
+      particles: instancedStats.reduce((s, st) => s + st.activeParticles, 0),
+      maxParticles: instancedStats.reduce((s, st) => s + st.maxParticles, 0),
+      drawCalls: instancedStats.reduce((s, st) => s + st.drawCalls, 0),
+      isMobile: instancedStats.length > 0 ? instancedStats[0].isMobile : false
     }
   }
 

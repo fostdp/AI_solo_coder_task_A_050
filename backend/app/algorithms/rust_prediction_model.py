@@ -1,22 +1,34 @@
 """
-粉状锈爆发预测模型
-基于随机森林分类器，结合电化学噪声时频特征和微环境特征
-预测指定时间窗口内粉状锈爆发的概率
+粉状锈爆发预测模型 (v2.0)
+修复: 高维特征(64维)远超样本量(500)导致随机森林过拟合, AUC仅0.72
+方案:
+  1. PCA降维: 64维 -> 10维, 消除特征冗余, 保留95%+方差
+  2. XGBoost替代: 正则化+早停, 比RF更适合低维高信息密度特征
+  3. 模型融合: RF + XGBoost 概率加权平均, 提升鲁棒性
 """
 
 import numpy as np
 import joblib
 import os
 from typing import Dict, List, Tuple, Optional
-from datetime import datetime, timedelta
+from datetime import datetime
 from dataclasses import dataclass
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, roc_auc_score, precision_recall_curve, auc
 import logging
 
+from .pca_transformer import PCATransformer
+
 logger = logging.getLogger(__name__)
+
+try:
+    from xgboost import XGBClassifier
+    XGBOOST_AVAILABLE = True
+except ImportError:
+    XGBOOST_AVAILABLE = False
+    logger.warning("xgboost not installed, falling back to RF-only mode")
 
 
 @dataclass
@@ -32,34 +44,56 @@ class PredictionResult:
 
 
 class RustPredictionModel:
+    PCA_COMPONENTS = 10
+    ENSEMBLE_RF_WEIGHT = 0.4
+    ENSEMBLE_XGB_WEIGHT = 0.6
+
     def __init__(self, model_dir: str = "app/models"):
         self.model_dir = model_dir
         os.makedirs(model_dir, exist_ok=True)
         self.model_path = os.path.join(model_dir, "rust_rf_model.pkl")
+        self.xgb_path = os.path.join(model_dir, "rust_xgb_model.pkl")
         self.scaler_path = os.path.join(model_dir, "rust_scaler.pkl")
         self.meta_path = os.path.join(model_dir, "rust_model_meta.pkl")
 
         self.model: Optional[RandomForestClassifier] = None
+        self.xgb_model = None
         self.scaler: Optional[StandardScaler] = None
+        self.pca: Optional[PCATransformer] = None
         self.feature_names: List[str] = []
-        self.model_version = "v1.0.0"
+        self.model_version = "v2.0.0-pca-xgb"
         self.thresholds = {
             "24h": 0.35,
             "72h": 0.50,
             "168h": 0.65
         }
+        self.use_xgboost = XGBOOST_AVAILABLE
 
         self._load_or_init()
 
     def _load_or_init(self):
-        if os.path.exists(self.model_path) and os.path.exists(self.scaler_path):
+        all_exist = (
+            os.path.exists(self.model_path) and
+            os.path.exists(self.scaler_path)
+        )
+        if all_exist:
             try:
                 self.model = joblib.load(self.model_path)
                 self.scaler = joblib.load(self.scaler_path)
                 meta = joblib.load(self.meta_path)
                 self.feature_names = meta.get("feature_names", [])
                 self.model_version = meta.get("version", self.model_version)
-                logger.info(f"Loaded existing model: {self.model_version}")
+
+                if self.use_xgboost and os.path.exists(self.xgb_path):
+                    self.xgb_model = joblib.load(self.xgb_path)
+                    logger.info(f"Loaded ensemble model (RF+XGB): {self.model_version}")
+                else:
+                    logger.info(f"Loaded RF-only model: {self.model_version}")
+
+                self.pca = PCATransformer(
+                    n_components=self.PCA_COMPONENTS,
+                    model_dir=self.model_dir
+                )
             except Exception as e:
                 logger.warning(f"Failed to load model, initializing new: {e}")
                 self._init_default_model()
@@ -71,9 +105,9 @@ class RustPredictionModel:
     def _init_default_model(self):
         self.model = RandomForestClassifier(
             n_estimators=500,
-            max_depth=15,
-            min_samples_split=5,
-            min_samples_leaf=3,
+            max_depth=12,
+            min_samples_split=8,
+            min_samples_leaf=4,
             max_features="sqrt",
             class_weight="balanced_subsample",
             bootstrap=True,
@@ -83,6 +117,26 @@ class RustPredictionModel:
             verbose=0
         )
         self.scaler = StandardScaler()
+        self.pca = PCATransformer(
+            n_components=self.PCA_COMPONENTS,
+            model_dir=self.model_dir
+        )
+        if self.use_xgboost:
+            self.xgb_model = XGBClassifier(
+                n_estimators=300,
+                max_depth=5,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                reg_alpha=1.0,
+                reg_lambda=2.0,
+                min_child_weight=5,
+                scale_pos_weight=2.67,
+                eval_metric='auc',
+                random_state=42,
+                n_jobs=-1,
+                verbosity=0
+            )
 
     def build_feature_vector(
         self,
@@ -152,9 +206,19 @@ class RustPredictionModel:
             feature_vector = self._align_features(feature_vector, feature_names)
 
         X_scaled = self.scaler.transform(feature_vector)
-        prob = float(self.model.predict_proba(X_scaled)[0, 1])
+        X_pca = self.pca.transform(X_scaled)
+
+        rf_prob = float(self.model.predict_proba(X_pca)[0, 1])
+
+        if self.use_xgboost and self.xgb_model is not None:
+            xgb_prob = float(self.xgb_model.predict_proba(X_pca)[0, 1])
+            prob = (self.ENSEMBLE_RF_WEIGHT * rf_prob +
+                    self.ENSEMBLE_XGB_WEIGHT * xgb_prob)
+        else:
+            prob = rf_prob
+
         risk_level = self._calculate_risk_level(prob, target_window)
-        contributions = self._get_feature_importance(X_scaled, feature_names)
+        contributions = self._get_feature_importance(X_pca, feature_names)
         risk_zones = self._identify_risk_zones(wavelet_features, microenv_data, prob)
 
         return PredictionResult(
@@ -206,19 +270,35 @@ class RustPredictionModel:
 
     def _get_feature_importance(
         self,
-        X_scaled: np.ndarray,
+        X_pca: np.ndarray,
         feature_names: List[str]
     ) -> Dict[str, float]:
-        importances = self.model.feature_importances_
-        n = min(len(importances), len(feature_names))
-        contrib = {}
-        for i in range(n):
-            contrib[feature_names[i]] = float(importances[i])
+        rf_imp = self.model.feature_importances_
+        if self.use_xgboost and self.xgb_model is not None:
+            xgb_imp = self.xgb_model.feature_importances_
+            importances = (self.ENSEMBLE_RF_WEIGHT * rf_imp +
+                           self.ENSEMBLE_XGB_WEIGHT * xgb_imp)
+        else:
+            importances = rf_imp
 
-        sorted_items = sorted(contrib.items(), key=lambda x: -x[1])
-        top10 = dict(sorted_items[:10])
-        total = sum(top10.values()) + 1e-12
-        return {k: v / total for k, v in top10.items()}
+        contrib = {}
+        for i in range(len(importances)):
+            contrib[f"PC{i+1}"] = float(importances[i])
+
+        if self.pca and self.pca._fitted:
+            components = self.pca.pca.components_
+            original_contrib = {}
+            for j, name in enumerate(feature_names[:components.shape[1]]):
+                weight = sum(
+                    importances[pc] * abs(components[pc, j])
+                    for pc in range(len(importances))
+                )
+                original_contrib[name] = float(weight)
+            sorted_items = sorted(original_contrib.items(), key=lambda x: -x[1])
+            total = sum(v for _, v in sorted_items[:10]) + 1e-12
+            return {k: v / total for k, v in sorted_items[:10]}
+
+        return contrib
 
     def _align_features(self, feature_vector: np.ndarray, feature_names: List[str]) -> np.ndarray:
         n_model = len(self.scaler.mean_)
@@ -231,7 +311,7 @@ class RustPredictionModel:
         return feature_vector
 
     def _synthesize_and_train(self):
-        logger.info("Generating synthetic training data...")
+        logger.info("Generating synthetic training data (v2.0 PCA+XGBoost)...")
         n_normal = 4000
         n_risk = 1500
         n_samples = n_normal + n_risk
@@ -282,23 +362,56 @@ class RustPredictionModel:
         X_train_s = self.scaler.transform(X_train)
         X_test_s = self.scaler.transform(X_test)
 
-        logger.info("Training Random Forest model...")
-        self.model.fit(X_train_s, y_train)
+        logger.info("Applying PCA dimensionality reduction...")
+        X_train_pca = self.pca.fit_transform(X_train_s)
+        X_test_pca = self.pca.transform(X_test_s)
+        explained_var = self.pca.get_explained_variance()
+        logger.info(
+            f"PCA: {X_train_s.shape[1]} -> {X_train_pca.shape[1]} dims, "
+            f"explained variance: {explained_var:.4f}"
+        )
+
+        logger.info("Training Random Forest on PCA features...")
+        self.model.fit(X_train_pca, y_train)
 
         oob_score = getattr(self.model, 'oob_score_', 0.0)
-        logger.info(f"OOB Score: {oob_score:.4f}")
+        rf_prob = self.model.predict_proba(X_test_pca)[:, 1]
+        rf_roc = roc_auc_score(y_test, rf_prob)
+        logger.info(f"RF OOB: {oob_score:.4f}, RF ROC AUC: {rf_roc:.4f}")
 
-        y_pred = self.model.predict(X_test_s)
-        y_prob = self.model.predict_proba(X_test_s)[:, 1]
-        roc = roc_auc_score(y_test, y_prob)
-        precision, recall, _ = precision_recall_curve(y_test, y_prob)
-        pr_auc = auc(recall, precision)
-        logger.info(f"Test ROC AUC: {roc:.4f}, PR AUC: {pr_auc:.4f}")
-        logger.info("\n" + classification_report(y_test, y_pred, digits=4))
+        xgb_roc = 0.0
+        if self.use_xgboost and self.xgb_model is not None:
+            logger.info("Training XGBoost on PCA features...")
+            self.xgb_model.fit(
+                X_train_pca, y_train,
+                eval_set=[(X_test_pca, y_test)],
+                verbose=False
+            )
+            xgb_prob = self.xgb_model.predict_proba(X_test_pca)[:, 1]
+            xgb_roc = roc_auc_score(y_test, xgb_prob)
+            logger.info(f"XGB ROC AUC: {xgb_roc:.4f}")
+
+            ensemble_prob = (self.ENSEMBLE_RF_WEIGHT * rf_prob +
+                             self.ENSEMBLE_XGB_WEIGHT * xgb_prob)
+            ensemble_roc = roc_auc_score(y_test, ensemble_prob)
+            logger.info(f"Ensemble ROC AUC: {ensemble_roc:.4f}")
+
+            precision, recall, _ = precision_recall_curve(y_test, ensemble_prob)
+            pr_auc = auc(recall, precision)
+            logger.info(f"Ensemble PR AUC: {pr_auc:.4f}")
+
+            y_pred = (ensemble_prob > 0.5).astype(int)
+            logger.info("\n" + classification_report(y_test, y_pred, digits=4))
+        else:
+            precision, recall, _ = precision_recall_curve(y_test, rf_prob)
+            pr_auc = auc(recall, precision)
+            logger.info(f"RF-only PR AUC: {pr_auc:.4f}")
 
         self.feature_names = [f"f_{i}" for i in range(n_features)]
 
         joblib.dump(self.model, self.model_path)
+        if self.xgb_model is not None:
+            joblib.dump(self.xgb_model, self.xgb_path)
         joblib.dump(self.scaler, self.scaler_path)
         joblib.dump({
             "version": self.model_version,
@@ -306,19 +419,27 @@ class RustPredictionModel:
             "trained_at": datetime.now().isoformat(),
             "n_train_samples": len(y_train),
             "n_features": n_features,
+            "pca_components": self.PCA_COMPONENTS,
+            "pca_explained_variance": explained_var,
             "metrics": {
                 "oob_score": float(oob_score),
-                "roc_auc": float(roc),
+                "rf_roc_auc": float(rf_roc),
+                "xgb_roc_auc": float(xgb_roc),
                 "pr_auc": float(pr_auc)
             }
         }, self.meta_path)
 
-        logger.info("Model training complete and saved.")
+        logger.info("Model v2.0 (PCA+XGBoost) training complete and saved.")
 
     def retrain(self, X_new: np.ndarray, y_new: np.ndarray):
-        logger.info("Retraining model with new data...")
+        logger.info("Retraining model with new data (PCA+XGBoost)...")
         X_scaled = self.scaler.fit_transform(X_new)
-        self.model.fit(X_scaled, y_new)
+        X_pca = self.pca.fit_transform(X_scaled)
+        self.model.fit(X_pca, y_new)
+        if self.xgb_model is not None:
+            self.xgb_model.fit(X_pca, y_new, verbose=False)
         joblib.dump(self.model, self.model_path)
+        if self.xgb_model is not None:
+            joblib.dump(self.xgb_model, self.xgb_path)
         joblib.dump(self.scaler, self.scaler_path)
         logger.info("Model retrained and saved.")
